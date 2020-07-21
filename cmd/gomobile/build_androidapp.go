@@ -12,7 +12,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"go/build"
 	"io"
 	"io/ioutil"
 	"log"
@@ -22,15 +21,22 @@ import (
 	"strings"
 
 	"golang.org/x/mobile/internal/binres"
+	"golang.org/x/tools/go/packages"
 )
 
-func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool, error) {
-	if ndkRoot == "" {
-		return nil, errors.New("no Android NDK path is set. Please run gomobile init with the ndk-bundle installed through the Android SDK manager or with the -ndk flag set.")
+func goAndroidBuild(pkg *packages.Package, androidArchs []string) (map[string]bool, error) {
+	ndkRoot, err := ndkRoot()
+	if err != nil {
+		return nil, err
 	}
-	appName := path.Base(pkg.ImportPath)
+	appName := path.Base(pkg.PkgPath)
 	libName := androidPkgName(appName)
-	manifestPath := filepath.Join(pkg.Dir, "AndroidManifest.xml")
+
+	// TODO(hajimehoshi): This works only with Go tools that assume all source files are in one directory.
+	// Fix this to work with other Go tools.
+	dir := filepath.Dir(pkg.GoFiles[0])
+
+	manifestPath := filepath.Join(dir, "AndroidManifest.xml")
 	manifestData, err := ioutil.ReadFile(manifestPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -63,7 +69,6 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 	nmpkgs := make(map[string]map[string]bool) // map: arch -> extractPkgs' output
 
 	for _, arch := range androidArchs {
-		env := androidEnv[arch]
 		toolchain := ndk.Toolchain(arch)
 		libPath := "lib/" + toolchain.abi + "/lib" + libName + ".so"
 		libAbsPath := filepath.Join(tmpdir, libPath)
@@ -71,15 +76,15 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 			return nil, err
 		}
 		err = goBuild(
-			pkg.ImportPath,
-			env,
+			pkg.PkgPath,
+			androidEnv[arch],
 			"-buildmode=c-shared",
 			"-o", libAbsPath,
 		)
 		if err != nil {
 			return nil, err
 		}
-		nmpkgs[arch], err = extractPkgs(toolchain.Path("nm"), libAbsPath)
+		nmpkgs[arch], err = extractPkgs(toolchain.Path(ndkRoot, "nm"), libAbsPath)
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +101,7 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 	}
 
 	if buildO == "" {
-		buildO = androidPkgName(filepath.Base(pkg.Dir)) + ".apk"
+		buildO = androidPkgName(path.Base(pkg.PkgPath)) + ".apk"
 	}
 	if !strings.HasSuffix(buildO, ".apk") {
 		return nil, fmt.Errorf("output file name %q does not end in '.apk'", buildO)
@@ -152,7 +157,7 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 	}
 	dexData, err := base64.StdEncoding.DecodeString(dexStr)
 	if err != nil {
-		log.Fatal("internal error bad dexStr: %v", err)
+		log.Fatalf("internal error bad dexStr: %v", err)
 	}
 	if _, err := w.Write(dexData); err != nil {
 		return nil, err
@@ -182,7 +187,7 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 	var arsc struct {
 		iconPath string
 	}
-	assetsDir := filepath.Join(pkg.Dir, "assets")
+	assetsDir := filepath.Join(dir, "assets")
 	assetsDirExists := true
 	fi, err := os.Stat(assetsDir)
 	if err != nil {
@@ -287,20 +292,15 @@ func goAndroidBuild(pkg *build.Package, androidArchs []string) (map[string]bool,
 // but not exactly same.
 func androidPkgName(name string) string {
 	var res []rune
-	for i, r := range name {
+	for _, r := range name {
 		switch {
-		case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z':
-			res = append(res, r)
-		case '0' <= r && r <= '9':
-			if i == 0 {
-				panic(fmt.Sprintf("package name %q is not a valid go package name", name))
-			}
+		case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9':
 			res = append(res, r)
 		default:
 			res = append(res, '_')
 		}
 	}
-	if len(res) == 0 || res[0] == '_' {
+	if len(res) == 0 || res[0] == '_' || ('0' <= res[0] && res[0] <= '9') {
 		// Android does not seem to allow the package part starting with _.
 		res = append([]rune{'g', 'o'}, res...)
 	}

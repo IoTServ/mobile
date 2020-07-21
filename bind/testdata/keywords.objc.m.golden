@@ -11,7 +11,7 @@
 @implementation KeywordsKeywordCaller {
 }
 
-- (instancetype)initWithRef:(id)ref {
+- (nonnull instancetype)initWithRef:(id)ref {
 	self = [super init];
 	if (self) { __ref = ref; }
 	return self;
@@ -25,6 +25,11 @@
 - (void)assert {
 	int32_t refnum = go_seq_go_to_refnum(self._ref);
 	proxykeywords_KeywordCaller_Assert(refnum);
+}
+
+- (void)bool_ {
+	int32_t refnum = go_seq_go_to_refnum(self._ref);
+	proxykeywords_KeywordCaller_Bool(refnum);
 }
 
 - (void)boolean {
@@ -177,6 +182,11 @@
 	proxykeywords_KeywordCaller_New(refnum);
 }
 
+- (void)nil_ {
+	int32_t refnum = go_seq_go_to_refnum(self._ref);
+	proxykeywords_KeywordCaller_Nil(refnum);
+}
+
 - (void)null {
 	int32_t refnum = go_seq_go_to_refnum(self._ref);
 	proxykeywords_KeywordCaller_Null(refnum);
@@ -286,12 +296,12 @@
 
 
 
-void KeywordsConst(NSString* id_) {
+void KeywordsConst(NSString* _Nullable id_) {
 	nstring _id_ = go_seq_from_objc_string(id_);
 	proxykeywords__Const(_id_);
 }
 
-void KeywordsStatic(NSString* strictfp) {
+void KeywordsStatic(NSString* _Nullable strictfp) {
 	nstring _strictfp = go_seq_from_objc_string(strictfp);
 	proxykeywords__Static(_strictfp);
 }
@@ -307,6 +317,13 @@ void cproxykeywords_KeywordCaller_Assert(int32_t refnum) {
 	@autoreleasepool {
 		KeywordsKeywordCaller* o = go_seq_objc_from_refnum(refnum);
 		[o assert];
+	}
+}
+
+void cproxykeywords_KeywordCaller_Bool(int32_t refnum) {
+	@autoreleasepool {
+		KeywordsKeywordCaller* o = go_seq_objc_from_refnum(refnum);
+		[o bool_];
 	}
 }
 
@@ -517,6 +534,13 @@ void cproxykeywords_KeywordCaller_New(int32_t refnum) {
 	@autoreleasepool {
 		KeywordsKeywordCaller* o = go_seq_objc_from_refnum(refnum);
 		[o new];
+	}
+}
+
+void cproxykeywords_KeywordCaller_Nil(int32_t refnum) {
+	@autoreleasepool {
+		KeywordsKeywordCaller* o = go_seq_objc_from_refnum(refnum);
+		[o nil_];
 	}
 }
 

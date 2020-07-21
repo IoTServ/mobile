@@ -6,8 +6,11 @@ package main
 
 import (
 	"bytes"
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"text/template"
@@ -54,6 +57,7 @@ func TestAndroidPkgName(t *testing.T) {
 		{".-.", "go___"},
 		{"abstract", "abstract_"},
 		{"Abstract", "Abstract"},
+		{"12345", "go12345"},
 	}
 
 	for _, tc := range tests {
@@ -65,6 +69,9 @@ func TestAndroidPkgName(t *testing.T) {
 }
 
 func TestAndroidBuild(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("not available on Android")
+	}
 	buf := new(bytes.Buffer)
 	defer func() {
 		xout = os.Stderr
@@ -76,13 +83,16 @@ func TestAndroidBuild(t *testing.T) {
 	buildX = true
 	buildO = "basic.apk"
 	buildTarget = "android/arm"
-	ndkRoot = "/NDK"
-	gopath = filepath.ToSlash(filepath.SplitList(os.Getenv("GOPATH"))[0])
+	gopath = filepath.ToSlash(filepath.SplitList(goEnv("GOPATH"))[0])
 	if goos == "windows" {
 		os.Setenv("HOMEDRIVE", "C:")
 	}
 	cmdBuild.flag.Parse([]string{"golang.org/x/mobile/example/basic"})
-	ctx.BuildTags = []string{"tag1"}
+	oldTags := buildTags
+	buildTags = []string{"tag1"}
+	defer func() {
+		buildTags = oldTags
+	}()
 	err := runBuild(cmdBuild)
 	if err != nil {
 		t.Log(buf.String())
@@ -101,12 +111,12 @@ func TestAndroidBuild(t *testing.T) {
 var androidBuildTmpl = template.Must(template.New("output").Parse(`GOMOBILE={{.GOPATH}}/pkg/gomobile
 WORK=$WORK
 mkdir -p $WORK/lib/armeabi-v7a
-GOOS=android GOARCH=arm CC=/NDK/toolchains/llvm/prebuilt/{{.GOOS}}-{{.NDKARCH}}/bin/clang{{.EXE}} CXX=/NDK/toolchains/llvm/prebuilt/{{.GOOS}}-{{.NDKARCH}}/bin/clang++{{.EXE}} CGO_CFLAGS=-target armv7a-none-linux-androideabi -gcc-toolchain /NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/{{.GOOS}}-{{.NDKARCH}} --sysroot /NDK/sysroot -isystem /NDK/sysroot/usr/include/arm-linux-androideabi -D__ANDROID_API__=15 -I$GOMOBILE/include CGO_CPPFLAGS=-target armv7a-none-linux-androideabi -gcc-toolchain /NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/{{.GOOS}}-{{.NDKARCH}} --sysroot /NDK/sysroot -isystem /NDK/sysroot/usr/include/arm-linux-androideabi -D__ANDROID_API__=15 -I$GOMOBILE/include CGO_LDFLAGS=-target armv7a-none-linux-androideabi -gcc-toolchain /NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/{{.GOOS}}-{{.NDKARCH}} --sysroot /NDK/platforms/android-15/arch-arm -L$GOMOBILE/lib/arm CGO_ENABLED=1 GOARM=7 go build -pkgdir=$GOMOBILE/pkg_android_arm -tags tag1 -x -buildmode=c-shared -o $WORK/lib/armeabi-v7a/libbasic.so golang.org/x/mobile/example/basic
+GOOS=android GOARCH=arm CC=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang CXX=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang++ CGO_ENABLED=1 GOARM=7 go build -tags tag1 -x -buildmode=c-shared -o $WORK/lib/armeabi-v7a/libbasic.so golang.org/x/mobile/example/basic
 `))
 
 func TestParseBuildTargetFlag(t *testing.T) {
-	androidArchs := "arm,arm64,386,amd64"
-	iosArchs := "arm,arm64,amd64"
+	androidArchs := strings.Join(allArchs("android"), ",")
+	iosArchs := strings.Join(allArchs("ios"), ",")
 
 	tests := []struct {
 		in        string
@@ -119,8 +129,8 @@ func TestParseBuildTargetFlag(t *testing.T) {
 		{"android/arm", false, "android", "arm"},
 
 		{"ios", false, "darwin", iosArchs},
-		{"ios,ios/arm", false, "darwin", iosArchs},
-		{"ios/arm", false, "darwin", "arm"},
+		{"ios,ios/arm64", false, "darwin", iosArchs},
+		{"ios/arm64", false, "darwin", "arm64"},
 		{"ios/amd64", false, "darwin", "amd64"},
 
 		{"", true, "", ""},
@@ -144,5 +154,119 @@ func TestParseBuildTargetFlag(t *testing.T) {
 			t.Errorf("-target=%q; want (%v, [%v], nil), got (%q, %q, %v)",
 				tc.in, tc.wantOS, tc.wantArchs, gotOS, gotArchs, err)
 		}
+	}
+}
+
+func TestRegexImportGolangXPackage(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string
+		wantLen int
+	}{
+		{"ffffffff t golang.org/x/mobile", "golang.org/x/mobile", 2},
+		{"ffffffff t github.com/example/repo/vendor/golang.org/x/mobile", "golang.org/x/mobile", 2},
+		{"ffffffff t github.com/example/golang.org/x/mobile", "", 0},
+		{"ffffffff t github.com/example/repo", "", 0},
+		{"ffffffff t github.com/example/repo/vendor", "", 0},
+	}
+
+	for _, tc := range tests {
+		res := nmRE.FindStringSubmatch(tc.in)
+		if len(res) != tc.wantLen {
+			t.Errorf("nmRE returned unexpected result for %q: want len(res) = %d, got %d",
+				tc.in, tc.wantLen, len(res))
+			continue
+		}
+		if tc.wantLen == 0 {
+			continue
+		}
+		if res[1] != tc.want {
+			t.Errorf("nmRE returned unexpected result. want (%v), got (%v)",
+				tc.want, res[1])
+		}
+	}
+}
+
+func TestBuildWithGoModules(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skipf("gomobile are not available on %s", runtime.GOOS)
+	}
+
+	dir, err := ioutil.TempDir("", "gomobile-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	if out, err := exec.Command("go", "build", "-o="+dir, "golang.org/x/mobile/cmd/gomobile").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, string(out))
+	}
+	path := dir
+	if p := os.Getenv("PATH"); p != "" {
+		path += string(filepath.ListSeparator) + p
+	}
+
+	for _, target := range []string{"android", "ios"} {
+		t.Run(target, func(t *testing.T) {
+			if target == "ios" {
+				t.Skip("gomobile-build doesn't work for iOS. see https://golang.org/issue/32963")
+			}
+
+			switch target {
+			case "android":
+				androidHome := os.Getenv("ANDROID_HOME")
+				if androidHome == "" {
+					t.Skip("ANDROID_HOME not found, skipping bind")
+				}
+				if _, err := androidAPIPath(); err != nil {
+					t.Skip("No android API platform found in $ANDROID_HOME, skipping bind")
+				}
+			case "ios":
+				if !xcodeAvailable() {
+					t.Skip("Xcode is missing")
+				}
+			}
+
+			var out string
+			switch target {
+			case "android":
+				out = filepath.Join(dir, "basic.apk")
+			case "ios":
+				out = filepath.Join(dir, "Basic.app")
+			}
+
+			tests := []struct {
+				Name string
+				Path string
+				Dir  string
+			}{
+				{
+					Name: "Absolute Path",
+					Path: "golang.org/x/mobile/example/basic",
+				},
+				{
+					Name: "Relative Path",
+					Path: "./example/basic",
+					Dir:  filepath.Join("..", ".."),
+				},
+			}
+
+			for _, tc := range tests {
+				tc := tc
+				t.Run(tc.Name, func(t *testing.T) {
+					args := []string{"build", "-target=" + target, "-o=" + out}
+					if target == "ios" {
+						args = append(args, "-bundleid=org.golang.gomobiletest")
+					}
+					args = append(args, tc.Path)
+					cmd := exec.Command(filepath.Join(dir, "gomobile"), args...)
+					cmd.Env = append(os.Environ(), "PATH="+path, "GO111MODULE=on")
+					cmd.Dir = tc.Dir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Errorf("gomobile build failed: %v\n%s", err, string(out))
+					}
+				})
+			}
+		})
 	}
 }

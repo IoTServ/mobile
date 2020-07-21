@@ -110,8 +110,8 @@ func (g *ObjcGen) GenGoH() error {
 		pkgPath = g.Pkg.Path()
 	}
 	g.Printf(objcPreamble, pkgPath, g.gobindOpts(), pkgPath)
-	g.Printf("#ifndef __%s_H__\n", g.pkgName)
-	g.Printf("#define __%s_H__\n\n", g.pkgName)
+	g.Printf("#ifndef __GO_%s_H__\n", g.pkgName)
+	g.Printf("#define __GO_%s_H__\n\n", g.pkgName)
 	g.Printf("#include <stdint.h>\n")
 	g.Printf("#include <objc/objc.h>\n")
 
@@ -149,6 +149,7 @@ func (g *ObjcGen) GenH() error {
 	for _, m := range g.modules {
 		g.Printf("@import %s;\n", m)
 	}
+	g.Printf("#include \"ref.h\"\n")
 	if g.Pkg != nil {
 		g.Printf("#include \"Universe.objc.h\"\n\n")
 	}
@@ -190,14 +191,14 @@ func (g *ObjcGen) GenH() error {
 	// const
 	// TODO: prefix with k?, or use a class method?
 	for _, obj := range g.constants {
-		if _, ok := obj.Type().(*types.Basic); !ok {
-			g.Printf("// skipped const %s with unsupported type: %T\n\n", obj.Name(), obj)
+		if _, ok := obj.Type().(*types.Basic); !ok || !g.isSupported(obj.Type()) {
+			g.Printf("// skipped const %s with unsupported type: %s\n\n", obj.Name(), obj.Type())
 			continue
 		}
 		g.objcdoc(g.docs[obj.Name()].Doc())
 		switch b := obj.Type().(*types.Basic); b.Kind() {
 		case types.String, types.UntypedString:
-			g.Printf("FOUNDATION_EXPORT NSString* const %s%s;\n", g.namePrefix, obj.Name())
+			g.Printf("FOUNDATION_EXPORT NSString* _Nonnull const %s%s;\n", g.namePrefix, obj.Name())
 		default:
 			g.Printf("FOUNDATION_EXPORT const %s %s%s;\n", g.objcType(obj.Type()), g.namePrefix, obj.Name())
 		}
@@ -211,7 +212,7 @@ func (g *ObjcGen) GenH() error {
 		g.Printf("@interface %s : NSObject\n", g.namePrefix)
 		for _, obj := range g.vars {
 			if t := obj.Type(); !g.isSupported(t) {
-				g.Printf("// skipped variable %s with unsupported type: %T\n\n", obj.Name(), t)
+				g.Printf("// skipped variable %s with unsupported type: %s\n\n", obj.Name(), t)
 				continue
 			}
 			objcType := g.objcType(obj.Type())
@@ -338,7 +339,7 @@ func (g *ObjcGen) GenM() error {
 
 func (g *ObjcGen) genVarM(o *types.Var) {
 	if t := o.Type(); !g.isSupported(t) {
-		g.Printf("// skipped variable %s with unsupported type: %T\n\n", o.Name(), t)
+		g.Printf("// skipped variable %s with unsupported type: %s\n\n", o.Name(), t)
 		return
 	}
 	objcType := g.objcType(o.Type())
@@ -364,8 +365,8 @@ func (g *ObjcGen) genVarM(o *types.Var) {
 }
 
 func (g *ObjcGen) genConstM(o *types.Const) {
-	if _, ok := o.Type().(*types.Basic); !ok {
-		g.Printf("// skipped const %s with unsupported type: %T\n\n", o.Name(), o)
+	if _, ok := o.Type().(*types.Basic); !ok || !g.isSupported(o.Type()) {
+		g.Printf("// skipped const %s with unsupported type: %s\n\n", o.Name(), o.Type())
 		return
 	}
 	cName := fmt.Sprintf("%s%s", g.namePrefix, o.Name())
@@ -537,14 +538,14 @@ func (g *ObjcGen) funcSummary(obj *types.TypeName, f *types.Func) *funcSummary {
 func (s *funcSummary) asFunc(g *ObjcGen) string {
 	var params []string
 	for _, p := range s.params {
-		params = append(params, g.objcType(p.typ)+" "+p.name)
+		params = append(params, g.objcParamType(p.typ)+" "+p.name)
 	}
 	skip := 0
 	if s.returnsVal() {
 		skip = 1
 	}
 	for _, p := range s.retParams[skip:] {
-		params = append(params, g.objcType(p.typ)+"* "+p.name)
+		params = append(params, g.objcType(p.typ)+"* _Nullable "+p.name)
 	}
 	paramContents := "void"
 	if len(params) > 0 {
@@ -568,7 +569,7 @@ func (s *funcSummary) asSignature(g *ObjcGen) string {
 		if i != 0 {
 			key = p.name
 		}
-		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcType(p.typ), p.name))
+		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcParamType(p.typ), p.name))
 	}
 	skip = 0
 	if s.returnsVal() {
@@ -579,7 +580,7 @@ func (s *funcSummary) asSignature(g *ObjcGen) string {
 		if len(params) > 0 {
 			key = p.name
 		}
-		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcType(p.typ)+"*", p.name))
+		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcType(p.typ)+"* _Nullable", p.name))
 	}
 	return strings.Join(params, " ")
 }
@@ -591,7 +592,7 @@ func (s *funcSummary) asInitSignature(g *ObjcGen) string {
 		if i > 0 {
 			key = p.name
 		}
-		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcType(p.typ), p.name))
+		params = append(params, fmt.Sprintf("%s:(%s)%s", key, g.objcParamType(p.typ), p.name))
 	}
 	return strings.Join(params, " ")
 }
@@ -863,7 +864,8 @@ func (g *ObjcGen) genFunc(s *funcSummary, objName string) {
 }
 
 func (g *ObjcGen) genInterfaceInterface(obj *types.TypeName, summary ifaceSummary, isProtocol bool) {
-	g.objcdoc(g.docs[obj.Name()].Doc())
+	doc := g.docs[obj.Name()]
+	g.objcdoc(doc.Doc())
 	g.Printf("@interface %[1]s%[2]s : ", g.namePrefix, obj.Name())
 	if isErrorType(obj.Type()) {
 		g.Printf("NSError")
@@ -876,15 +878,16 @@ func (g *ObjcGen) genInterfaceInterface(obj *types.TypeName, summary ifaceSummar
 	}
 	g.Printf(" <%s>", strings.Join(prots, ", "))
 	g.Printf(" {\n}\n")
-	g.Printf("@property(strong, readonly) id _ref;\n")
+	g.Printf("@property(strong, readonly) _Nonnull id _ref;\n")
 	g.Printf("\n")
-	g.Printf("- (instancetype)initWithRef:(id)ref;\n")
+	g.Printf("- (nonnull instancetype)initWithRef:(_Nonnull id)ref;\n")
 	for _, m := range summary.callable {
 		if !g.isSigSupported(m.Type()) {
 			g.Printf("// skipped method %s.%s with unsupported parameter or return types\n\n", obj.Name(), m.Name())
 			continue
 		}
 		s := g.funcSummary(nil, m)
+		g.objcdoc(doc.Member(m.Name()))
 		g.Printf("- %s;\n", s.asMethod(g))
 	}
 	g.Printf("@end\n")
@@ -915,7 +918,7 @@ func (g *ObjcGen) genInterfaceM(obj *types.TypeName, t *types.Interface) bool {
 	g.Printf("@implementation %s%s {\n", g.namePrefix, obj.Name())
 	g.Printf("}\n")
 	g.Printf("\n")
-	g.Printf("- (instancetype)initWithRef:(id)ref {\n")
+	g.Printf("- (nonnull instancetype)initWithRef:(id)ref {\n")
 	g.Indent()
 	if isErrorType(obj.Type()) {
 		g.Printf("if (self) {\n")
@@ -1066,6 +1069,22 @@ func (g *ObjcGen) genStructH(obj *types.TypeName, t *types.Struct) {
 	}
 	pT := types.NewPointer(obj.Type())
 	for _, iface := range g.allIntf {
+		p := iface.obj.Pkg()
+		if g.Pkg != nil && g.Pkg != p {
+			// To avoid header include cycles, only declare implementation of interfaces
+			// from imported packages. TODO(elias.naur): Include every interface that
+			// doesn't introduce an include cycle.
+			found := false
+			for _, imp := range g.Pkg.Imports() {
+				if imp == p {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
 		obj := iface.obj
 		if types.AssignableTo(pT, obj.Type()) {
 			n := fmt.Sprintf("%s%s", g.namePrefixOf(obj.Pkg()), obj.Name())
@@ -1078,9 +1097,9 @@ func (g *ObjcGen) genStructH(obj *types.TypeName, t *types.Struct) {
 	}
 	g.Printf(" {\n")
 	g.Printf("}\n")
-	g.Printf("@property(strong, readonly) id _ref;\n")
+	g.Printf("@property(strong, readonly) _Nonnull id _ref;\n")
 	g.Printf("\n")
-	g.Printf("- (instancetype)initWithRef:(id)ref;\n")
+	g.Printf("- (nonnull instancetype)initWithRef:(_Nonnull id)ref;\n")
 	cons := g.constructors[obj]
 	if oinf == nil {
 		for _, f := range cons {
@@ -1092,19 +1111,21 @@ func (g *ObjcGen) genStructH(obj *types.TypeName, t *types.Struct) {
 		}
 	}
 	if oinf != nil || len(cons) == 0 {
-		g.Printf("- (instancetype)init;\n")
+		// default constructor won't return nil
+		g.Printf("- (nonnull instancetype)init;\n")
 	}
 
 	// accessors to exported fields.
 	for _, f := range exportedFields(t) {
 		if t := f.Type(); !g.isSupported(t) {
-			g.Printf("// skipped field %s.%s with unsupported type: %T\n\n", obj.Name(), f.Name(), t)
+			g.Printf("// skipped field %s.%s with unsupported type: %s\n\n", obj.Name(), f.Name(), t)
 			continue
 		}
-		name, typ := f.Name(), g.objcFieldType(f.Type())
+		name, typ := f.Name(), g.objcType(f.Type())
 		g.objcdoc(doc.Member(f.Name()))
-		g.Printf("- (%s)%s;\n", typ, objcNameReplacer(lowerFirst(name)))
-		g.Printf("- (void)set%s:(%s)v;\n", name, typ)
+
+		// properties are atomic by default so explicitly say otherwise
+		g.Printf("@property (nonatomic) %s %s;\n", typ, objcNameReplacer(lowerFirst(name)))
 	}
 
 	// exported methods
@@ -1135,7 +1156,7 @@ func (g *ObjcGen) genStructM(obj *types.TypeName, t *types.Struct) {
 	oinf := g.ostructs[obj]
 	g.Printf("@implementation %s%s {\n", g.namePrefix, obj.Name())
 	g.Printf("}\n\n")
-	g.Printf("- (instancetype)initWithRef:(id)ref {\n")
+	g.Printf("- (nonnull instancetype)initWithRef:(_Nonnull id)ref {\n")
 	g.Indent()
 	g.Printf("self = [super init];\n")
 	g.Printf("if (self) { __ref = ref; }\n")
@@ -1145,11 +1166,15 @@ func (g *ObjcGen) genStructM(obj *types.TypeName, t *types.Struct) {
 	cons := g.constructors[obj]
 	if oinf == nil {
 		for _, f := range cons {
+			if !g.isSigSupported(f.Type()) {
+				g.Printf("// skipped constructor %s.%s with unsupported parameter or return types\n\n", obj, f.Name())
+				continue
+			}
 			g.genInitM(obj, f)
 		}
 	}
 	if oinf != nil || len(cons) == 0 {
-		g.Printf("- (instancetype)init {\n")
+		g.Printf("- (nonnull instancetype)init {\n")
 		g.Indent()
 		g.Printf("self = [super init];\n")
 		g.Printf("if (self) {\n")
@@ -1164,7 +1189,7 @@ func (g *ObjcGen) genStructM(obj *types.TypeName, t *types.Struct) {
 
 	for _, f := range fields {
 		if !g.isSupported(f.Type()) {
-			g.Printf("// skipped unsupported field %s with type %T\n\n", f.Name(), f)
+			g.Printf("// skipped unsupported field %s with type %s\n\n", f.Name(), f.Type())
 			continue
 		}
 		g.genGetter(obj.Name(), f)
@@ -1190,7 +1215,9 @@ func (g *ObjcGen) genInitH(obj *types.TypeName, f *types.Func) {
 	s := g.funcSummary(obj, f)
 	doc := g.docs[f.Name()]
 	g.objcdoc(doc.Doc())
-	g.Printf("- (instancetype)%s%s;\n", s.initName, s.asInitSignature(g))
+
+	// custom inits can return nil in Go so make them nullable
+	g.Printf("- (nullable instancetype)%s%s;\n", s.initName, s.asInitSignature(g))
 }
 
 func (g *ObjcGen) genInitM(obj *types.TypeName, f *types.Func) {
@@ -1260,16 +1287,24 @@ func (g *ObjcGen) refTypeBase(typ types.Type) string {
 	return g.objcType(typ)
 }
 
-func (g *ObjcGen) objcFieldType(t types.Type) string {
-	if isErrorType(t) {
-		return "NSError*"
+func (g *ObjcGen) objcParamType(t types.Type) string {
+
+	switch typ := t.(type) {
+	case *types.Basic:
+		switch typ.Kind() {
+		case types.String, types.UntypedString:
+			return "NSString* _Nullable"
+		}
 	}
+
 	return g.objcType(t)
+
 }
 
 func (g *ObjcGen) objcType(typ types.Type) string {
+
 	if isErrorType(typ) {
-		return "NSError*"
+		return "NSError* _Nullable"
 	}
 
 	switch typ := typ.(type) {
@@ -1301,7 +1336,7 @@ func (g *ObjcGen) objcType(typ types.Type) string {
 		case types.Float64, types.UntypedFloat:
 			return "double"
 		case types.String, types.UntypedString:
-			return "NSString*"
+			return "NSString* _Nonnull"
 		default:
 			g.errorf("unsupported type: %s", typ)
 			return "TODO"
@@ -1310,7 +1345,7 @@ func (g *ObjcGen) objcType(typ types.Type) string {
 		elem := g.objcType(typ.Elem())
 		// Special case: NSData seems to be a better option for byte slice.
 		if elem == "byte" {
-			return "NSData*"
+			return "NSData* _Nullable"
 		}
 		// TODO(hyangah): support other slice types: NSArray or CFArrayRef.
 		// Investigate the performance implication.
@@ -1318,7 +1353,7 @@ func (g *ObjcGen) objcType(typ types.Type) string {
 		return "TODO"
 	case *types.Pointer:
 		if _, ok := typ.Elem().(*types.Named); ok {
-			return g.objcType(typ.Elem()) + "*"
+			return g.objcType(typ.Elem()) + "* _Nullable"
 		}
 		g.errorf("unsupported pointer to type: %s", typ)
 		return "TODO"
@@ -1335,9 +1370,9 @@ func (g *ObjcGen) objcType(typ types.Type) string {
 		switch t := typ.Underlying().(type) {
 		case *types.Interface:
 			if makeIfaceSummary(t).implementable {
-				return "id<" + g.namePrefixOf(n.Pkg()) + n.Name() + ">"
+				return "id<" + g.namePrefixOf(n.Pkg()) + n.Name() + "> _Nullable"
 			} else {
-				return g.namePrefixOf(n.Pkg()) + n.Name() + "*"
+				return g.namePrefixOf(n.Pkg()) + n.Name() + "* _Nullable"
 			}
 		case *types.Struct:
 			return g.namePrefixOf(n.Pkg()) + n.Name()
@@ -1376,9 +1411,10 @@ func isObjcType(t types.Type) bool {
 }
 
 var objcNameReplacer = newNameSanitizer([]string{
-	"void", "char", "short", "int", "long", "float", "double", "signed",
-	"unsigned", "id", "const", "volatile", "in", "out", "inout", "bycopy",
-	"byref", "oneway", "self", "super", "init"})
+	"bool", "bycopy", "byref", "char", "const", "double", "float",
+	"id", "in", "init", "inout", "int", "long", "nil", "oneway",
+	"out", "self", "short", "signed", "super", "unsigned", "void",
+	"volatile"})
 
 const (
 	objcPreamble = `// Objective-C API for talking to %[1]s Go package.

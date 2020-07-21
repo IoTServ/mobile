@@ -5,13 +5,10 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/build"
-	"go/importer"
-	"go/parser"
-	"go/token"
 	"go/types"
 	"io/ioutil"
 	"log"
@@ -22,15 +19,18 @@ import (
 
 	"golang.org/x/mobile/internal/importers"
 	"golang.org/x/mobile/internal/importers/java"
+	"golang.org/x/mobile/internal/importers/objc"
+	"golang.org/x/tools/go/packages"
 )
 
 var (
-	lang          = flag.String("lang", "java", "target language for bindings, either java, go, or objc (experimental).")
+	lang          = flag.String("lang", "", "target languages for bindings, either java, go, or objc. If empty, all languages are generated.")
 	outdir        = flag.String("outdir", "", "result will be written to the directory instead of stdout.")
 	javaPkg       = flag.String("javapkg", "", "custom Java package path prefix. Valid only with -lang=java.")
 	prefix        = flag.String("prefix", "", "custom Objective-C name prefix. Valid only with -lang=objc.")
 	bootclasspath = flag.String("bootclasspath", "", "Java bootstrap classpath.")
 	classpath     = flag.String("classpath", "", "Java classpath.")
+	tags          = flag.String("tags", "", "build tags.")
 )
 
 var usage = `The Gobind tool generates Java language bindings for Go.
@@ -40,96 +40,124 @@ For usage details, see doc.go.`
 func main() {
 	flag.Parse()
 
-	if *lang != "java" && *javaPkg != "" {
-		log.Fatalf("Invalid option -javapkg for gobind -lang=%s", *lang)
-	} else if *lang != "objc" && *prefix != "" {
-		log.Fatalf("Invalid option -prefix for gobind -lang=%s", *lang)
+	run()
+	os.Exit(exitStatus)
+}
+
+func run() {
+	var langs []string
+	if *lang != "" {
+		langs = strings.Split(*lang, ",")
+	} else {
+		langs = []string{"go", "java", "objc"}
 	}
 
-	oldCtx := build.Default
-	ctx := &build.Default
-	var allPkg []*build.Package
-	for _, path := range flag.Args() {
-		pkg, err := ctx.Import(path, ".", build.ImportComment)
-		if err != nil {
-			log.Fatalf("package %q: %v", path, err)
-		}
-		allPkg = append(allPkg, pkg)
+	// We need to give appropriate environment variables like CC or CXX so that the returned packages no longer have errors.
+	// However, getting such environment variables is difficult or impossible so far.
+	// Gomobile can obtain such environment variables in env.go, but this logic assumes some condiitons gobind doesn't assume.
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles |
+			packages.NeedImports | packages.NeedDeps |
+			packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo,
+		BuildFlags: []string{"-tags", strings.Join(strings.Split(*tags, ","), " ")},
 	}
-	var classes []*java.Class
-	refs, err := importers.AnalyzePackages(allPkg, "Java/")
+
+	// Call Load twice to warm the cache. There is a known issue that the result of Load
+	// depends on build cache state. See golang/go#33687.
+	packages.Load(cfg, flag.Args()...)
+
+	allPkg, err := packages.Load(cfg, flag.Args()...)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if len(refs.Refs) > 0 {
-		imp := &java.Importer{
+
+	jrefs, err := importers.AnalyzePackages(allPkg, "Java/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	orefs, err := importers.AnalyzePackages(allPkg, "ObjC/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var classes []*java.Class
+	if len(jrefs.Refs) > 0 {
+		jimp := &java.Importer{
 			Bootclasspath: *bootclasspath,
 			Classpath:     *classpath,
 			JavaPkg:       *javaPkg,
 		}
-		classes, err = imp.Import(refs)
+		classes, err = jimp.Import(jrefs)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if len(classes) > 0 {
-			tmpGopath, err := ioutil.TempDir(os.TempDir(), "gobind-")
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer os.RemoveAll(tmpGopath)
-			if err := genJavaPackages(ctx, tmpGopath, classes, refs.Embedders); err != nil {
-				log.Fatal(err)
-			}
-			gopath := ctx.GOPATH
-			if gopath != "" {
-				gopath = string(filepath.ListSeparator)
-			}
-			ctx.GOPATH = gopath + tmpGopath
+	}
+	var otypes []*objc.Named
+	if len(orefs.Refs) > 0 {
+		otypes, err = objc.Import(orefs)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
-	// Make sure the export data for any imported packages are up to date.
-	cmd := exec.Command("go", "install")
-	cmd.Args = append(cmd.Args, flag.Args()...)
-	cmd.Env = append(os.Environ(), "GOPATH="+ctx.GOPATH)
-	cmd.Env = append(cmd.Env, "GOROOT="+ctx.GOROOT)
-	if err := cmd.Run(); err != nil {
-		// Only report I/O errors. Errors from go install is expected for as-yet
-		// undefined Java wrappers.
-		if _, ok := err.(*exec.ExitError); !ok {
-			fmt.Fprintf(os.Stderr, "%s failed: %v", strings.Join(cmd.Args, " "), err)
-			os.Exit(1)
+	if len(classes) > 0 || len(otypes) > 0 {
+		srcDir := *outdir
+		if srcDir == "" {
+			srcDir, err = ioutil.TempDir(os.TempDir(), "gobind-")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer os.RemoveAll(srcDir)
+		} else {
+			srcDir, err = filepath.Abs(srcDir)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		if len(classes) > 0 {
+			if err := genJavaPackages(srcDir, classes, jrefs.Embedders); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if len(otypes) > 0 {
+			if err := genObjcPackages(srcDir, otypes, orefs.Embedders); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		// Add a new directory to GOPATH where the file for reverse bindings exist, and recreate allPkg.
+		// It is because the current allPkg did not solve imports for reverse bindings.
+		var gopath string
+		if out, err := exec.Command("go", "env", "GOPATH").Output(); err != nil {
+			log.Fatal(err)
+		} else {
+			gopath = string(bytes.TrimSpace(out))
+		}
+		if gopath != "" {
+			gopath = string(filepath.ListSeparator) + gopath
+		}
+		gopath = srcDir + gopath
+		cfg.Env = append(os.Environ(), "GOPATH="+gopath)
+		allPkg, err = packages.Load(cfg, flag.Args()...)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
 	typePkgs := make([]*types.Package, len(allPkg))
-	fset := token.NewFileSet()
-	conf := &types.Config{
-		Importer: importer.Default(),
-	}
-	conf.Error = func(err error) {
-		// Ignore errors. They're probably caused by as-yet undefined
-		// Java wrappers.
-	}
+	astPkgs := make([][]*ast.File, len(allPkg))
 	for i, pkg := range allPkg {
-		var files []*ast.File
-		for _, name := range pkg.GoFiles {
-			f, err := parser.ParseFile(fset, filepath.Join(pkg.Dir, name), nil, 0)
-			if err != nil {
-				log.Fatalf("Failed to parse Go file %s: %v", name, err)
-			}
-			files = append(files, f)
+		// Ignore pkg.Errors. pkg.Errors can exist when Cgo is used, but this should not affect the result.
+		// See the discussion at golang/go#36547.
+		typePkgs[i] = pkg.Types
+		astPkgs[i] = pkg.Syntax
+	}
+	for _, l := range langs {
+		for i, pkg := range typePkgs {
+			genPkg(l, pkg, astPkgs[i], typePkgs, classes, otypes)
 		}
-		tpkg, _ := conf.Check(pkg.Name, fset, files, nil)
-		typePkgs[i] = tpkg
+		// Generate the error package and support files
+		genPkg(l, nil, nil, typePkgs, classes, otypes)
 	}
-	build.Default = oldCtx
-	for _, pkg := range typePkgs {
-		genPkg(pkg, typePkgs, classes)
-	}
-	// Generate the error package and support files
-	genPkg(nil, typePkgs, classes)
-	os.Exit(exitStatus)
 }
 
 var exitStatus = 0

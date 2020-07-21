@@ -35,16 +35,9 @@ package app
 #include <pthread.h>
 #include <stdlib.h>
 
-JavaVM* current_vm;
-jobject current_ctx;
-jclass current_ctx_clazz;
-
-jclass app_find_class(JNIEnv* env, const char* name);
-
 EGLDisplay display;
 EGLSurface surface;
 
-char* initEGLDisplay();
 char* createEGLSurface(ANativeWindow* window);
 char* destroyEGLSurface();
 int32_t getKeyRune(JNIEnv* env, AInputEvent* e);
@@ -67,9 +60,21 @@ import (
 	"golang.org/x/mobile/internal/mobileinit"
 )
 
+// RunOnJVM runs fn on a new goroutine locked to an OS thread with a JNIEnv.
+//
+// RunOnJVM blocks until the call to fn is complete. Any Java
+// exception or failure to attach to the JVM is returned as an error.
+//
+// The function fn takes vm, the current JavaVM*,
+// env, the current JNIEnv*, and
+// ctx, a jobject representing the global android.context.Context.
+func RunOnJVM(fn func(vm, jniEnv, ctx uintptr) error) error {
+	return mobileinit.RunOnJVM(fn)
+}
+
 //export setCurrentContext
 func setCurrentContext(vm *C.JavaVM, ctx C.jobject) {
-	mobileinit.SetCurrentContext(unsafe.Pointer(vm), unsafe.Pointer(ctx))
+	mobileinit.SetCurrentContext(unsafe.Pointer(vm), uintptr(ctx))
 }
 
 //export callMain
@@ -132,7 +137,7 @@ func onDestroy(activity *C.ANativeActivity) {
 }
 
 //export onWindowFocusChanged
-func onWindowFocusChanged(activity *C.ANativeActivity, hasFocus int) {
+func onWindowFocusChanged(activity *C.ANativeActivity, hasFocus C.int) {
 }
 
 //export onNativeWindowCreated
@@ -431,9 +436,9 @@ func processKey(env *C.JNIEnv, e *C.AInputEvent) {
 		Code: convAndroidKeyCode(int32(C.AKeyEvent_getKeyCode(e))),
 	}
 	switch C.AKeyEvent_getAction(e) {
-	case C.AKEY_STATE_DOWN:
+	case C.AKEY_EVENT_ACTION_DOWN:
 		k.Direction = key.DirPress
-	case C.AKEY_STATE_UP:
+	case C.AKEY_EVENT_ACTION_UP:
 		k.Direction = key.DirRelease
 	default:
 		k.Direction = key.DirNone

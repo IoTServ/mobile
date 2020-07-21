@@ -6,8 +6,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
-	"go/build"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -15,24 +16,33 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template"
+
+	"golang.org/x/tools/go/packages"
 )
 
-func goIOSBuild(pkg *build.Package) (map[string]bool, error) {
-	src := pkg.ImportPath
+func goIOSBuild(pkg *packages.Package, bundleID string, archs []string) (map[string]bool, error) {
+	src := pkg.PkgPath
 	if buildO != "" && !strings.HasSuffix(buildO, ".app") {
 		return nil, fmt.Errorf("-o must have an .app for -target=ios")
 	}
 
-	productName := rfc1034Label(path.Base(pkg.ImportPath))
+	productName := rfc1034Label(path.Base(pkg.PkgPath))
 	if productName == "" {
 		productName = "ProductName" // like xcode.
+	}
+
+	projPbxproj := new(bytes.Buffer)
+	if err := projPbxprojTmpl.Execute(projPbxproj, projPbxprojTmplData{
+		BitcodeEnabled: bitcodeEnabled,
+	}); err != nil {
+		return nil, err
 	}
 
 	infoplist := new(bytes.Buffer)
 	if err := infoplistTmpl.Execute(infoplist, infoplistTmplData{
 		// TODO: better bundle id.
-		BundleID: "org.golang.todo." + productName,
-		Name:     strings.Title(path.Base(pkg.ImportPath)),
+		BundleID: bundleID + "." + productName,
+		Name:     strings.Title(path.Base(pkg.PkgPath)),
 	}); err != nil {
 		return nil, err
 	}
@@ -41,7 +51,7 @@ func goIOSBuild(pkg *build.Package) (map[string]bool, error) {
 		name     string
 		contents []byte
 	}{
-		{tmpdir + "/main.xcodeproj/project.pbxproj", []byte(projPbxproj)},
+		{tmpdir + "/main.xcodeproj/project.pbxproj", projPbxproj.Bytes()},
 		{tmpdir + "/main/Info.plist", infoplist.Bytes()},
 		{tmpdir + "/main/Images.xcassets/AppIcon.appiconset/Contents.json", []byte(contentsJSON)},
 	}
@@ -60,31 +70,29 @@ func goIOSBuild(pkg *build.Package) (map[string]bool, error) {
 		}
 	}
 
-	ctx.BuildTags = append(ctx.BuildTags, "ios")
-
-	armPath := filepath.Join(tmpdir, "arm")
-	if err := goBuild(src, darwinArmEnv, "-o="+armPath); err != nil {
-		return nil, err
-	}
-	nmpkgs, err := extractPkgs(darwinArmNM, armPath)
-	if err != nil {
-		return nil, err
-	}
-
-	arm64Path := filepath.Join(tmpdir, "arm64")
-	if err := goBuild(src, darwinArm64Env, "-o="+arm64Path); err != nil {
-		return nil, err
-	}
-
-	// Apple requires builds to target both darwin/arm and darwin/arm64.
 	// We are using lipo tool to build multiarchitecture binaries.
-	// TODO(jbd): Investigate the new announcements about iO9's fat binary
-	// size limitations are breaking this feature.
 	cmd := exec.Command(
 		"xcrun", "lipo",
-		"-create", armPath, arm64Path,
 		"-o", filepath.Join(tmpdir, "main/main"),
+		"-create",
 	)
+	var nmpkgs map[string]bool
+	for _, arch := range archs {
+		path := filepath.Join(tmpdir, arch)
+		// Disable DWARF; see golang.org/issues/25148.
+		if err := goBuild(src, darwinEnv[arch], "-ldflags=-w", "-o="+path); err != nil {
+			return nil, err
+		}
+		if nmpkgs == nil {
+			var err error
+			nmpkgs, err = extractPkgs(darwinArmNM, path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		cmd.Args = append(cmd.Args, path)
+	}
+
 	if err := runCmd(cmd); err != nil {
 		return nil, err
 	}
@@ -94,19 +102,29 @@ func goIOSBuild(pkg *build.Package) (map[string]bool, error) {
 		return nil, err
 	}
 
+	// Detect the team ID
+	teamID, err := detectTeamID()
+	if err != nil {
+		return nil, err
+	}
+
 	// Build and move the release build to the output directory.
-	cmd = exec.Command(
-		"xcrun", "xcodebuild",
+	cmdStrings := []string{
+		"xcodebuild",
 		"-configuration", "Release",
-		"-project", tmpdir+"/main.xcodeproj",
-	)
+		"-project", tmpdir + "/main.xcodeproj",
+		"-allowProvisioningUpdates",
+		"DEVELOPMENT_TEAM=" + teamID,
+	}
+
+	cmd = exec.Command("xcrun", cmdStrings...)
 	if err := runCmd(cmd); err != nil {
 		return nil, err
 	}
 
 	// TODO(jbd): Fallback to copying if renaming fails.
 	if buildO == "" {
-		n := pkg.ImportPath
+		n := pkg.PkgPath
 		if n == "." {
 			// use cwd name
 			cwd, err := os.Getwd()
@@ -133,13 +151,48 @@ func goIOSBuild(pkg *build.Package) (map[string]bool, error) {
 	return nmpkgs, nil
 }
 
-func iosCopyAssets(pkg *build.Package, xcodeProjDir string) error {
+func detectTeamID() (string, error) {
+	// Grabs the first certificate for "iPhone Developer"; will not work if there
+	// are multiple certificates and the first is not desired.
+	cmd := exec.Command(
+		"security", "find-certificate",
+		"-c", "iPhone Developer", "-p",
+	)
+	pemString, err := cmd.Output()
+	if err != nil {
+		err = fmt.Errorf("failed to pull the signing certificate to determine your team ID: %v", err)
+		return "", err
+	}
+
+	block, _ := pem.Decode(pemString)
+	if block == nil {
+		err = fmt.Errorf("failed to decode the PEM to determine your team ID: %s", pemString)
+		return "", err
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		err = fmt.Errorf("failed to parse your signing certificate to determine your team ID: %v", err)
+		return "", err
+	}
+
+	if len(cert.Subject.OrganizationalUnit) == 0 {
+		err = fmt.Errorf("the signing certificate has no organizational unit (team ID).")
+		return "", err
+	}
+
+	return cert.Subject.OrganizationalUnit[0], nil
+}
+
+func iosCopyAssets(pkg *packages.Package, xcodeProjDir string) error {
 	dstAssets := xcodeProjDir + "/main/assets"
 	if err := mkdir(dstAssets); err != nil {
 		return err
 	}
 
-	srcAssets := filepath.Join(pkg.Dir, "assets")
+	// TODO(hajimehoshi): This works only with Go tools that assume all source files are in one directory.
+	// Fix this to work with other Go tools.
+	srcAssets := filepath.Join(filepath.Dir(pkg.GoFiles[0]), "assets")
 	fi, err := os.Stat(srcAssets)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -225,7 +278,11 @@ var infoplistTmpl = template.Must(template.New("infoplist").Parse(`<?xml version
 </plist>
 `))
 
-const projPbxproj = `// !$*UTF8*$!
+type projPbxprojTmplData struct {
+	BitcodeEnabled bool
+}
+
+var projPbxprojTmpl = template.Must(template.New("projPbxproj").Parse(`// !$*UTF8*$!
 {
   archiveVersion = 1;
   classes = {
@@ -383,6 +440,7 @@ const projPbxproj = `// !$*UTF8*$!
         SDKROOT = iphoneos;
         TARGETED_DEVICE_FAMILY = "1,2";
         VALIDATE_PRODUCT = YES;
+        {{if not .BitcodeEnabled}}ENABLE_BITCODE = NO;{{end}}
       };
       name = Release;
     };
@@ -419,7 +477,7 @@ const projPbxproj = `// !$*UTF8*$!
   };
   rootObject = 254BB8361B1FD08900C56DE9 /* Project object */;
 }
-`
+`))
 
 const contentsJSON = `{
   "images" : [
